@@ -1,96 +1,264 @@
 # Docket
 
-Turn your docs into an embeddable, doc-grounded chat widget.
+Turn your docs into an embeddable, document-grounded chat widget.
+
+Upload PDFs, text files, or Markdown to a project. Docket chunks them, embeds each chunk using a local Ollama model, and stores the vectors in Supabase with pgvector. When a visitor asks a question, the chat widget retrieves the most relevant chunks and uses a local LLM to answer — strictly from your documents, with source citations.
+
+---
+
+## Tech stack
+
+| Layer | What's used |
+|---|---|
+| Framework | Next.js 14 (App Router) |
+| Database + vectors | Supabase (Postgres + pgvector) |
+| Embeddings model | `nomic-embed-text` via Ollama |
+| Chat model | `qwen3:8b` via Ollama |
+| Text splitting | LangChain `RecursiveCharacterTextSplitter` |
+| PDF parsing | `unpdf` |
+| Styling | Tailwind CSS |
+
+---
+
+## Prerequisites
+
+- [Node.js](https://nodejs.org) 18+
+- [Ollama](https://ollama.com) running locally with the required models pulled:
+  ```bash
+  ollama pull nomic-embed-text
+  ollama pull qwen3:8b
+  ```
+- A [Supabase](https://supabase.com) project with pgvector enabled and the schema below applied
+
+---
+
+## Supabase schema
+
+Run this in your Supabase SQL editor before starting:
+
+```sql
+-- Enable the pgvector extension
+create extension if not exists vector;
+
+-- Projects
+create table projects (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  description text default '',
+  created_at timestamptz default now()
+);
+
+-- Documents (one row per uploaded file)
+create table documents (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid references projects(id) on delete cascade,
+  name text not null,
+  created_at timestamptz default now()
+);
+
+-- Chunks (one row per text chunk, with its embedding)
+create table chunks (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid references projects(id) on delete cascade,
+  document_id uuid references documents(id) on delete cascade,
+  content text not null,
+  embedding vector(768)  -- nomic-embed-text produces 768-dimensional vectors
+);
+
+-- Vector similarity search function (used by /api/chat)
+create or replace function match_chunks(
+  query_embedding vector(768),
+  filter_project_id text,
+  match_threshold float,
+  match_count int
+)
+returns table (
+  id uuid,
+  content text,
+  document_name text,
+  similarity float
+)
+language sql stable
+as $$
+  select
+    chunks.id,
+    chunks.content,
+    documents.name as document_name,
+    1 - (chunks.embedding <=> query_embedding) as similarity
+  from chunks
+  join documents on chunks.document_id = documents.id
+  where chunks.project_id::text = filter_project_id
+    and 1 - (chunks.embedding <=> query_embedding) > match_threshold
+  order by similarity desc
+  limit match_count;
+$$;
+```
+
+---
 
 ## Getting started
 
 ```bash
 cp .env.example .env.local
-# edit .env.local — set ADMIN_USERNAME, ADMIN_PASSWORD, and a random JWT_SECRET
-# generate a secret with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# Fill in the values — see Environment variables below
 
 npm install
 npm run dev
 ```
 
 Open http://localhost:3000 for the landing page, or http://localhost:3000/dashboard
-(you'll be redirected to `/login` if you're not signed in).
+(redirects to `/login` if you're not signed in).
+
+---
+
+## Environment variables
+
+```env
+# Admin credentials — no user table, single user only
+ADMIN_USERNAME=your_username
+ADMIN_PASSWORD=your_password
+
+# Random secret for signing session cookies
+# Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+JWT_SECRET=your_secret_here
+
+# Supabase — from your project's API settings
+DATABASE_URL=https://your-project.supabase.co
+SUPABASE_ANON_KEY=your_anon_key
+
+# Ollama — defaults to localhost if not set
+OLLAMA_BASE_URL=http://localhost:11434
+```
+
+---
 
 ## Routes
 
-| Route | What it is | Protected? |
+| Route | What it is | Auth required |
 |---|---|---|
 | `/` | Marketing landing page | No |
 | `/login` | Sign in | No |
 | `/dashboard` | Projects list | Yes |
-| `/dashboard/[id]/documents` | Upload docs for one project | Yes |
-| `/dashboard/[id]/chat` | Test the bot (preview only for now) | Yes |
-| `/dashboard/[id]/leads` | Leads captured by that project's bot | Yes |
+| `/dashboard/[id]/documents` | Upload & view docs for a project | Yes |
+| `/dashboard/[id]/chat` | Test the RAG chat bot (preview) | Yes |
 | `/dashboard/[id]/embed` | Copyable embed snippet | Yes |
-| `/embed/[projectId]` | The actual widget, rendered inside the iframe | No — visitors need this |
-| `/api/projects`, `/api/projects/[id]/documents` | Backing API routes | Yes |
+| `/embed/[projectId]` | The widget rendered inside an iframe | No (visitors use this) |
+| `POST /api/projects` | Create a project | Yes |
+| `GET /api/projects/[id]` | Fetch a project with its documents | Yes |
+| `POST /api/projects/[id]/documents` | Upload, chunk, embed & store documents | Yes |
+| `POST /api/chat/[projectId]` | RAG chat — query → embed → vector search → LLM | No (widget uses this) |
+| `POST /api/auth/login` | Authenticate and set session cookie | No |
+| `POST /api/auth/logout` | Clear session cookie | No |
 
-"Protected" means `src/middleware.js` checks for a valid session cookie and
-redirects to `/login` (or returns 401 for API calls) if it's missing or expired.
+---
+
+## How RAG works in this project
+
+```
+User question
+    │
+    ▼
+/api/chat/[projectId]
+    │
+    ├─ 1. Embed the question using nomic-embed-text (via Ollama)
+    │
+    ├─ 2. Run match_chunks() in Supabase — vector similarity search
+    │      filtered by project_id (threshold 0.15, top 2 chunks)
+    │
+    ├─ 3. Inject retrieved chunks into the system prompt as context
+    │      (see src/lib/systemPrompt.js)
+    │
+    └─ 4. Send messages array to qwen3:8b (via Ollama)
+           The model answers strictly from the retrieved context
+           and cites sources like (Source 1), (Source 2)
+```
+
+The system prompt uses few-shot examples and explicit grounding rules to prevent hallucination — the model is instructed never to use information outside the provided context.
+
+---
+
+## Document ingestion pipeline
+
+When you upload a file on `/dashboard/[id]/documents`:
+
+```
+File upload (multipart/form-data)
+    │
+    ├─ PDF → text extracted with unpdf
+    ├─ .txt / .md → read as plain text
+    │
+    ├─ Text split into 500-char chunks (50-char overlap)
+    │    using LangChain RecursiveCharacterTextSplitter
+    │
+    ├─ Each chunk embedded with nomic-embed-text → vector(768)
+    │
+    └─ Chunks + embeddings inserted into Supabase chunks table
+         scoped to project_id and document_id
+```
+
+---
 
 ## Project structure
 
 ```
-public/                 Static assets, including widget.js (the embeddable loader script)
+public/
+  widget.js               Embeddable loader script (drop on any site)
+
 src/
-  app/                  Routing only — layouts, pages, API route handlers
-  components/           Small, generic, reusable UI (Modal, Logo)
-  features/             Domain-specific UI, grouped by feature
+  app/                    Routing only — layouts, pages, API route handlers
+    api/
+      auth/               login + logout endpoints
+      projects/           CRUD for projects and document ingestion
+      chat/[projectId]/   RAG chat endpoint
+    dashboard/            Protected dashboard pages
+    embed/                Public widget iframe page
+
+  components/             Small reusable UI (Logo, Modal)
+
+  context/
+    ProjectContext.js     Provides current project to client components
+
+  features/               Domain UI grouped by feature
     auth/                 Login form, logout button
-    projects/             Project list, create form, tab nav
-    documents/             Upload UI
-    chat/                  Test chat preview
-    leads/                 Leads table
-    embed/                 Embed snippet + copy button
-    widget/                The public-facing chat widget itself
-  hooks/                 Shared React hooks (useCopyToClipboard)
-  lib/                   Server-side helpers (auth signing, the mock data store)
-  utils/                 Small pure helper functions (formatRelativeTime)
-middleware.js            Guards /dashboard and /api/projects
+    projects/             Project list, create modal, tab nav
+    documents/            Upload drop-zone, document list
+    chat/                 Test chat preview panel
+    embed/                Embed snippet + copy button
+    widget/               Public-facing chat widget
+
+  hooks/                  Shared React hooks
+  lib/
+    auth.js               Session cookie signing/verification (HMAC-SHA256)
+    embeddings.js         Ollama nomic-embed-text wrapper
+    generateChat.js       Ollama qwen3:8b chat wrapper
+    supabase.js           Supabase client (server-side, stateless)
+    systemPrompt.js       RAG system prompt builder (few-shot + grounding rules)
+  utils/
+    ollama.js             Text chunking via LangChain
+
+middleware.js             Guards /dashboard/* and /api/projects/*
 ```
+
+---
 
 ## Auth
 
-Single admin user, no signup, no user table. Credentials are checked against
-`ADMIN_USERNAME` / `ADMIN_PASSWORD` in your env file. On success, a signed
-session cookie is set (HMAC-SHA256 over an expiry timestamp, using
-`JWT_SECRET`) and `src/middleware.js` checks it on every request to
-`/dashboard/*` and `/api/projects/*`.
+Single admin user — no signup, no user table. Credentials are set in `.env.local` as `ADMIN_USERNAME` and `ADMIN_PASSWORD`. On successful login, a signed session cookie is issued (HMAC-SHA256 over an expiry timestamp using `JWT_SECRET`). `middleware.js` verifies this cookie on every request to `/dashboard/*` and `/api/projects/*`.
 
-This is intentionally simple for a single-user project — not a general auth
-system. If you ever add more users, swap this for real sessions (or NextAuth)
-backed by a database.
+Not a general-purpose auth system — if you need multiple users, replace this with NextAuth or a proper session library backed by the database.
 
-## The mock data store
+---
 
-`src/lib/mockStore.js` holds projects, documents, and leads in a plain
-in-memory array — no database yet. It's written with the same function
-shapes a real DB-backed version would have (`listProjects()`, `getProject(id)`,
-`createProject()`, etc.), so swapping it for real Postgres queries later
-shouldn't require touching any of the pages or components that call it.
+## Embedding widget on your site
 
-Two things to know about it:
-- Data resets whenever the dev server restarts or hot-reloads.
-- It only works as a single Node process — it will not survive a
-  serverless/edge deployment. Replace it before shipping for real.
+Go to `/dashboard/[id]/embed` to get your project's embed snippet. It looks like:
 
-## Not wired up yet — next steps
+```html
+<script
+  src="https://your-docket-domain.com/widget.js"
+  data-project-id="your-project-id"
+  defer
+></script>
+```
 
-1. **Postgres + pgvector** — `projects`, `documents`, `chunks`, `leads`
-   tables (`chunks` stores `project_id` + `embedding vector(768)` for
-   `nomic-embed-text`), replacing `mockStore.js`
-2. **Ollama helpers** — `embed()` and `generate()` wrapper functions hitting
-   `OLLAMA_BASE_URL`
-3. **Real ingestion** — wire `src/app/api/projects/[id]/documents/route.js`
-   to parse an actual file upload (multipart, not JSON filenames), chunk it,
-   embed each chunk, and insert rows scoped to `project_id`
-4. **Chat route** — `/api/chat/[projectId]` — embed the query, vector search
-   filtered by `project_id`, stream a response — this is what
-   `TestChatPanel` and `ChatWidget` will call once it exists
-5. **Lead submission** — wire the widget's "Talk to a human" form to a real
-   `POST /api/projects/[id]/leads` route
+Drop it anywhere in your site's `<body>`. It injects a floating chat button that opens an iframe pointing at `/embed/[projectId]` — the widget only knows about documents uploaded to that specific project.
